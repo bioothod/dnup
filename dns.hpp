@@ -13,7 +13,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#define uloga(f, a...) fprintf(stderr, f, ##a)
+#define uloga(f, a...) fprintf(stdout, f, ##a)
 #define ulog_err(f, a...) uloga(f ": %s [%d].\n", ##a, strerror(errno), errno)
 
 #define QUERY_DEBUG
@@ -46,16 +46,16 @@
 #define QUERY_FLAGS_RCODE_NOT_IMPL	4	/* not implemented response code */
 #define QUERY_FLAGS_RCODE_REFUSED	5	/* refused response code */
 
-typedef unsigned char __u8;
-typedef unsigned short __u16;
-typedef unsigned int __u32;
+typedef unsigned char u8;
+typedef unsigned short u16;
+typedef unsigned int u32;
 
-static inline void query_set_flags_opcode(__u16 *flags, __u16 opcode)
+static inline void query_set_flags_opcode(u16 *flags, u16 opcode)
 {
 	*flags |= (opcode & QUERY_FLAGS_OPCODE_MASK) << QUERY_FLAGS_OPCODE_SHIFT;
 }
 
-static inline void query_set_flags_rcode(__u16 *flags, __u16 rcode)
+static inline void query_set_flags_rcode(u16 *flags, u16 rcode)
 {
 	*flags |= (rcode & QUERY_FLAGS_RCODE_MASK) << QUERY_FLAGS_RCODE_SHIFT;
 }
@@ -71,18 +71,6 @@ struct query_header
 };
 
 #define QUERY_RR_NAME_MAX_SIZE	256
-
-struct rr
-{
-	char			name[QUERY_RR_NAME_MAX_SIZE];
-	int			namelen;
-
-	__u16			type;
-	__u16			qclass;
-	__u32			ttl;
-	__u16			rdlen;
-	unsigned char		rdata[0];
-};
 
 enum query_class {
 	QUERY_CLASS_IN = 1,	/* Internet */
@@ -114,16 +102,161 @@ enum query_type {
 	QUERY_TYPE_ALL,		/* A request for all records */
 };
 
-class dns {
+class name {
 	public:
-		void parse(const u_char *data, size_t size) {
-			if (size < sizeof(struct query_header))
-				return;
+		name(const u_char *message, size_t offset, size_t size) : m_namelen(0), m_max_size(size), m_consumed(0) {
+			memset(m_name, 0, sizeof(m_name));
+			parse(message, message + offset);
+		}
 
-			query_parse_answer(data);
+		size_t consumed() const {
+			return m_consumed;
+		}
+
+		const char *data() const {
+			return m_name;
 		}
 
 	private:
+		char m_name[QUERY_RR_NAME_MAX_SIZE];
+		size_t m_namelen;
+		size_t m_max_size;
+		size_t m_consumed;
+
+		void parse(const u_char *message, const u_char *nptr) {
+			unsigned char len;
+
+			while (nptr && (len = *nptr)) {
+				m_consumed += 1;
+
+				if (len & 0xc0) {
+					u16 o = ((u16 *)nptr)[0];
+					u16 offset = ntohs(o) & ~0xc000;
+
+					size_t old_consumed = m_consumed;
+					parse(message, message + offset);
+					m_consumed = old_consumed + 1;
+					return;
+				} else {
+					if (m_namelen + len + 1 >= sizeof(m_name)) {
+						std::ostringstream ss;
+						ss << "name: parser went out of name bounds: current-name-len: " << m_namelen << ", new-chunk-len: " << len << ", max: " << sizeof(m_name);
+						throw std::runtime_error(ss.str());
+					}
+
+					nptr++;
+					strncpy(m_name + m_namelen, (char *)nptr, len);
+					nptr += len;
+
+					m_name[m_namelen + len] = '.';
+					m_namelen += len + 1;
+
+					m_consumed += len;
+				}
+
+				if (m_consumed >= m_max_size) {
+					std::ostringstream ss;
+					ss << "name: parser went out of message bounds: namelen: " << m_namelen << ", message-size: " << m_max_size;
+					throw std::runtime_error(ss.str());
+				}
+			}
+
+			m_consumed += 1; // name section is terminated with 0-byte
+
+			m_namelen--; // drop last '.'
+			m_name[m_namelen] = '\0';
+		}
+};
+
+class question {
+	public:
+		question(const u_char *message, size_t offset, size_t size) : m_name(message, offset, size) {
+			const u16 *data = (const u16 *)(message + offset + m_name.consumed());
+
+			m_type = ntohs(data[0]);
+			m_class = ntohs(data[1]);
+
+			uloga("question: name: '%s', type: %d, class: %d.\n", m_name.data(), m_type, m_class);
+		}
+
+		size_t consumed() const {
+			return m_name.consumed() + 2 * 2;
+		}
+
+	private:
+		name m_name;
+		u16 m_type, m_class;
+};
+
+class rr {
+	public:
+		rr(const u_char *message, size_t offset, size_t size) : m_name(message, offset, size) {
+			const u16 *data = (const u16 *)(message + offset + m_name.consumed());
+			for (size_t i = 0; i < size; ++i) {
+				printf("%02x ", message[i]);
+			}
+			printf("\noffset: %zd, consumed: %zd\n", offset, m_name.consumed());
+
+			m_type = ntohs(data[0]);
+			m_class = ntohs(data[1]);
+			m_ttl = ntohl(*(u32 *)(data + 2));
+
+			u16 rdlen = ntohs(data[4]);
+			m_rdata.assign((char *)message + offset + m_name.consumed() + 10, rdlen);
+
+			uloga("rr: name: '%s', type: %d, class: %d, ttl: %d, rdlen: %d.\n", m_name.data(), m_type, m_class, m_ttl, rdlen);
+		}
+
+		u16 type() const {
+			return m_type;
+		}
+
+		std::string rdata() const {
+			return m_rdata;
+		}
+
+		size_t consumed() const {
+			return m_name.consumed() + 10 + m_rdata.size();
+		}
+	private:
+		name m_name;
+		std::string m_rdata;
+
+		u16 m_type;
+		u16 m_class;
+		u32 m_ttl;
+};
+
+class dns {
+	public:
+		void parse(const u_char *message, size_t size) {
+			if (size < sizeof(struct query_header))
+				return;
+
+			struct query_header *h = (struct query_header *)message;
+			query_parse_header(h);
+
+			size_t offset = sizeof(struct query_header);
+			for (int i = 0; i < h->question_num; ++i) {
+				question q(message, offset, size);
+				offset += q.consumed();
+
+				m_questions.emplace_back(std::move(q));
+			}
+
+			for (int i = 0; i < h->answer_num + h->auth_num + h->addon_num; ++i) {
+				rr r(message, offset, size);
+				offset += r.consumed();
+
+				m_rrs.emplace_back(std::move(r));
+			}
+		}
+
+	private:
+		u16 m_id, m_flags;
+		std::vector<question> m_questions;
+		std::vector<rr> m_rrs;
+
 		void query_header_convert(struct query_header *h) {
 			h->id = ntohs(h->id);
 			h->flags = ntohs(h->flags);
@@ -134,9 +267,12 @@ class dns {
 		}
 
 		void query_parse_header(struct query_header *h) {
-			__u16 opcode, rcode;
+			u16 opcode, rcode;
 
 			query_header_convert(h);
+
+			m_id = h->id;
+			m_flags = h->flags;
 
 			opcode = (h->flags >> QUERY_FLAGS_OPCODE_SHIFT) & QUERY_FLAGS_OPCODE_MASK;
 			rcode = (h->flags >> QUERY_FLAGS_RCODE_SHIFT) & QUERY_FLAGS_RCODE_MASK;
@@ -152,182 +288,14 @@ class dns {
 					rcode);
 			uloga("question: %d, answer: %d, auth: %d, addon: %d.\n",
 					h->question_num, h->answer_num, h->auth_num, h->addon_num);
-		}
 
-		int query_parse_name(const u_char *message, const u_char *nptr, char *dst, int *off) {
-			unsigned char len;
-			int err, name_len;
-
-			len = 0;
-			name_len = 0;
-			*off = 0;
-
-			while ((len = *nptr)) {
-				if (len & 0xc0) {
-					__u16 o = ((__u16 *)nptr)[0];
-					__u16 offset = ntohs(o) & ~0xc000;
-
-					err = query_parse_name(message, message + offset, dst, off);
-					dst += err;
-					name_len += err;
-					nptr += 2;
-					*off = 2;
-					return name_len;
-				} else {
-					nptr++;
-					strncpy(dst, (char *)nptr, len);
-					dst += len;
-					*dst++ = '.';
-					nptr += len;
-					name_len += len + 1;
-				}
-			}
-			*dst = '\0';
-			name_len++;
-
-			*off = name_len;
-
-			return name_len;
-		}
-
-		int query_parse_rdata_ns(const u_char *message, const u_char *rdata,
-				__u16 rlen __attribute__ ((unused)), char *dst,
-				int dsize __attribute__ ((unused)))
-		{
-			int offset;
-			return query_parse_name(message, rdata, dst, &offset);
-		}
-
-		int query_parse_rdata_a(const u_char *message __attribute__ ((unused)),
-				const u_char *rdata, __u16 rlen, char *dst, int dsize)
-		{
-			if (rlen != 4)
-				return -EINVAL;
-
-			return snprintf(dst, dsize, "%s", inet_ntoa(*((struct in_addr *)rdata)));
-		}
-
-		struct rr *query_parse_rr(const u_char *message, const u_char *data, unsigned int *off)
-		{
-			struct rr *rr;
-			__u16 rlen;
-			int name_len, offset, header_inner_size = 10;
-			char name[QUERY_RR_NAME_MAX_SIZE];
-
-			name_len = query_parse_name(message, data, name, &offset);
-			data += offset;
-
-			rlen = ntohs(((__u16 *)data)[4]);
-
-			if (!rlen)
-				return NULL;
-
-			rr = (struct rr *)malloc(sizeof(struct rr) + rlen + 1);
-			if (!rr)
-				return NULL;
-
-			memset(rr, 0, sizeof(rr) + rlen + 1);
-
-			rr->namelen = snprintf(rr->name, sizeof(rr->name), "%s", name);
-			rr->type = ntohs(((__u16 *)data)[0]);
-			rr->qclass = ntohs(((__u16 *)data)[1]);
-			rr->ttl = ntohl(((__u32 *)data)[1]);
-			rr->rdlen = rlen;
-			memcpy(rr->rdata, data + header_inner_size, rr->rdlen);
-
-			uloga("name: '%s', type: %d, class: %d, ttl: %u, rdlen: %d",
-					rr->name, rr->type, rr->qclass, rr->ttl, rr->rdlen);
-
-			char rdata[QUERY_RR_NAME_MAX_SIZE];
-			switch (rr->type) {
-				case QUERY_TYPE_A:
-					query_parse_rdata_a(message, rr->rdata, rr->rdlen, rdata, sizeof(rdata));
-					uloga(", rdata: %s", rdata);
-					break;
-				case QUERY_TYPE_NS:
-					query_parse_rdata_ns(message, rr->rdata, rr->rdlen, rdata, sizeof(rdata));
-					uloga(", rdata: %s", rdata);
-					break;
-			}
-
-			uloga("\n");
-
-			*off = offset + rlen + header_inner_size;
-			return rr;
-		}
-
-		int query_parse_question(const u_char *message, const u_char *data,
-				char *name, __u16 *type, __u16 *qclass)
-		{
-			int name_len, offset;
-
-			name_len = query_parse_name(message, data, name, &offset);
-			data += offset;
-
-			*type = ntohs(((__u16 *)data)[0]);
-			*qclass = ntohs(((__u16 *)data)[1]);
-
-			uloga("question: name: '%s', type: %d, class: %d.\n",
-					name, *type, *qclass);
-
-			return offset + 4;
-		}
-
-		int query_parse_answer(const u_char *data)
-		{
-			u_char *rrh;
-			struct query_header *h = (struct query_header *)data;
-			struct rr *rr;
-			int i;
-			unsigned int offset;
-			char name[QUERY_RR_NAME_MAX_SIZE];
-			__u16 type, qclass;
-
-			query_parse_header(h);
-
-			rrh = (u_char *)(h + 1);
-
-			for (i=0; i<h->question_num; ++i) {
-				rrh += query_parse_question(data, rrh, name, &type, &qclass);
-			}
-
-			for (i=0; i<h->answer_num + h->auth_num + h->addon_num; ++i) {
-				offset = 0;
-				rr = query_parse_rr(data, rrh, &offset);
-				if (!rr)
-					break;
-
-				free(rr);
-
-				rrh += offset;
-			}
-
-			if (!rr)
-				return -EINVAL;
-
-			return 0;
-		}
-
-		int query_add_rr_noname(__u16 *a, struct rr *rr)
-		{
-			__u32 *ttl;
-
-			a[0] = htons(rr->type);
-			a[1] = htons(rr->qclass);
-			ttl = (__u32 *)&a[2];
-			ttl[0] = htonl(rr->ttl);
-			a[4] = htons(rr->rdlen);
-			memcpy(&a[5], rr->rdata, rr->rdlen);
-
-			return rr->rdlen + 10;
-		}
-
-		int query_add_rr(u_char *answer, struct rr *rr)
-		{
-			__u16 *a = (__u16 *)answer;
-
-			a[0] = htons(0xc000 | sizeof(struct query_header));
-
-			return 2 + query_add_rr_noname(&a[1], rr);
+#define CHECK_INVAL(x) do { \
+	if ((x) > 100) \
+		throw std::runtime_error(#x); \
+	} while (0);
+			CHECK_INVAL(h->question_num);
+			CHECK_INVAL(h->answer_num);
+			CHECK_INVAL(h->auth_num);
+			CHECK_INVAL(h->addon_num);
 		}
 };

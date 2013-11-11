@@ -166,10 +166,15 @@ struct basic_process {
 		udp = (struct udphdr *)(packet + sizeof(*eth) + ip_size);
 
 		std::cout << header->ts << ": " << dump_eth(eth) << " : " << dump_addr(ip, udp) << std::endl;
-		dns d;
 
-		u_char *data = (u_char *)(((u_char *)udp) + 8);
-		d.parse(data, ntohs(udp->len));
+		try {
+			dns d;
+
+			u_char *data = (u_char *)(((u_char *)udp) + 8);
+			d.parse(data, ntohs(udp->len));
+		} catch (const std::exception &e) {
+			std::cout << "failed to process: " << e.what() << std::endl;
+		}
 	}
 };
 
