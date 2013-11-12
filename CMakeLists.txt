@@ -3,7 +3,7 @@ project (dnssniff)
 
 add_definitions(-g -std=c++11 -W -Wall -Wextra -fstack-protector-all)
 
-find_package(Boost REQUIRED COMPONENTS system program_options)
+find_package(Boost REQUIRED COMPONENTS system program_options regex)
 
 INCLUDE(cmake/locate_library.cmake)
 LOCATE_LIBRARY(PCAP "pcap.h" "pcap")
@@ -18,8 +18,8 @@ link_directories(
 	${PCAP_LIBRARY_DIRS}
 )
 
-add_executable(dnssniff sniff.cpp)
-target_link_libraries(dnssniff
+add_executable(dpoison sniff.cpp)
+target_link_libraries(dpoison
 	${Boost_LIBRARIES}
 	${PCAP_LIBRARIES}
 )

@@ -7,12 +7,17 @@
 #include <netinet/udp.h>
 #include <arpa/inet.h>
 
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+
 #include <iostream>
 #include <cstdlib>
 
 #include <pcap.h>
 
 #include <boost/program_options.hpp>
+#include <boost/regex.hpp>
 
 #include "dns.hpp"
 
@@ -118,64 +123,120 @@ class pcap {
 
 };
 
-struct basic_process {
-	void dump_eth_single(std::ostringstream &ss, const u_int8_t *header) {
-		char tmp[4];
-
-		for (int i = 0; i < ETH_ALEN; ++i) {
-			snprintf(tmp, sizeof(tmp), "%02x", header[i]);
-			ss << tmp;
-			if (i < ETH_ALEN - 1)
-				ss << ":";
+class basic_process {
+	public:
+		basic_process(const std::string &query, const std::map<int, std::string> &rdata_repl) : m_re(query), m_repl(rdata_repl) {
 		}
-	}
 
-	std::string dump_eth(const struct ether_header *eth) {
-		std::ostringstream ss;
-		dump_eth_single(ss, eth->ether_shost);
-		ss << " -> ";
-		dump_eth_single(ss, eth->ether_dhost);
-		//ss << ", type: " << eth->ether_type;
+		void got_packet(const struct pcap_pkthdr *header, const u_char *packet) {
+			const struct ether_header *eth;
+			const struct ip *ip;
+			const struct udphdr *udp;
 
-		return ss.str();
-	}
-
-	std::string dump_addr(const struct ip *ip, const struct udphdr *udp) {
-		std::ostringstream ss;
-
-		ss << inet_ntoa(ip->ip_src) << ":" << ntohs(udp->source);
-		ss << " -> ";
-		ss << inet_ntoa(ip->ip_dst) << ":" << ntohs(udp->dest);
-		ss << " : data-size: " << ntohs(udp->len);
-
-		return ss.str();
-	}
-
-	void got_packet(const struct pcap_pkthdr *header, const u_char *packet) {
-		const struct ether_header *eth;
-		const struct ip *ip;
-		const struct udphdr *udp;
-
-		eth = (const struct ether_header *)packet;
-		ip = (const struct ip *)(packet + sizeof(*eth));
+			eth = (const struct ether_header *)packet;
+			ip = (const struct ip *)(packet + sizeof(*eth));
 
 #define IP_HL(ip)		(((ip)->ip_hl) & 0x0f)
 #define IP_V(ip)		(((ip)->ip_hl) >> 4)
 
-		int ip_size = IP_HL(ip) * 4;
-		udp = (struct udphdr *)(packet + sizeof(*eth) + ip_size);
+			int ip_size = IP_HL(ip) * 4;
+			udp = (struct udphdr *)(packet + sizeof(*eth) + ip_size);
 
-		std::cout << header->ts << ": " << dump_eth(eth) << " : " << dump_addr(ip, udp) << std::endl;
+			try {
+				dns d;
 
-		try {
-			dns d;
-
-			u_char *data = (u_char *)(((u_char *)udp) + 8);
-			d.parse(data, ntohs(udp->len));
-		} catch (const std::exception &e) {
-			std::cout << "failed to process: " << e.what() << std::endl;
+				u_char *data = (u_char *)(((u_char *)udp) + 8);
+				if (d.parse(data, ntohs(udp->len), m_re, m_repl)) {
+					std::cout << header->ts << ": " << dump_eth(eth) << " : " << dump_addr(ip, udp) << std::endl;
+					inject(d);
+				}
+			} catch (const std::exception &e) {
+				std::cout << "failed to process: " << e.what() << std::endl;
+			}
 		}
-	}
+
+	private:
+		boost::regex m_re;
+		std::map<int, std::string> m_repl;
+
+		void dump_eth_single(std::ostringstream &ss, const u_int8_t *header) {
+			char tmp[4];
+
+			for (int i = 0; i < ETH_ALEN; ++i) {
+				snprintf(tmp, sizeof(tmp), "%02x", header[i]);
+				ss << tmp;
+				if (i < ETH_ALEN - 1)
+					ss << ":";
+			}
+		}
+
+		std::string dump_eth(const struct ether_header *eth) {
+			std::ostringstream ss;
+			dump_eth_single(ss, eth->ether_shost);
+			ss << " -> ";
+			dump_eth_single(ss, eth->ether_dhost);
+			//ss << ", type: " << eth->ether_type;
+
+			return ss.str();
+		}
+
+		std::string dump_addr(const struct ip *ip, const struct udphdr *udp) {
+			std::ostringstream ss;
+
+			ss << inet_ntoa(ip->ip_src) << ":" << ntohs(udp->source);
+			ss << " -> ";
+			ss << inet_ntoa(ip->ip_dst) << ":" << ntohs(udp->dest);
+			ss << " : data-size: " << ntohs(udp->len);
+
+			return ss.str();
+		}
+
+		void inject(const dns &d) {
+		}
+};
+
+class addr {
+	public:
+		addr(const std::string &addr_str, bool ipv6) {
+			struct addrinfo *ai = NULL, hint;
+			int err;
+
+			memset(&hint, 0, sizeof(struct addrinfo));
+
+			if (ipv6) {
+				hint.ai_family = AF_INET6;
+			} else {
+				hint.ai_family = AF_INET;
+			}
+
+			err = getaddrinfo(addr_str.c_str(), NULL, &hint, &ai);
+			if (!err && ai) {
+				if (ipv6) {
+					struct sockaddr_in6 *in = (struct sockaddr_in6 *)ai->ai_addr;
+					m_addr.assign((char *)&in->sin6_addr, sizeof(in->sin6_addr));
+				} else {
+					struct sockaddr_in *in = (struct sockaddr_in *)ai->ai_addr;
+					m_addr.assign((char *)&in->sin_addr, sizeof(in->sin_addr));
+				}
+			}
+
+			if (!err && !ai)
+				err = -ENXIO;
+			freeaddrinfo(ai);
+
+			if (err) {
+				std::ostringstream ss;
+				ss << "addr: could not convert '" << addr_str << "': " << err;
+				throw std::runtime_error(ss.str());
+			}
+		}
+
+		const std::string &get() const {
+			return m_addr;
+		}
+
+	private:
+		std::string m_addr;
 };
 
 int main(int argc, char *argv[])
@@ -184,12 +245,15 @@ int main(int argc, char *argv[])
 
 	bpo::options_description generic("Parser options");
 
-	std::string device;
+	std::string device, query, a_repl, aaaa_repl;
 	int max_size;
 	generic.add_options()
 		("help", "This help message")
 		("size", bpo::value<int>(&max_size)->default_value(1000), "Maximum capture size for single packet")
 		("device", bpo::value<std::string>(&device), "Sniffing device")
+		("query", bpo::value<std::string>(&query), "DNS query to hijack replies")
+		("A", bpo::value<std::string>(&a_repl), "Replace A record reply with this address")
+		("AAAA", bpo::value<std::string>(&aaaa_repl), "Replace AAAA record reply with this address")
 		;
 
 	bpo::positional_options_description positional;
@@ -226,7 +290,17 @@ int main(int argc, char *argv[])
 	std::ostringstream filter;
 	std::copy(words.begin(), words.end(), std::ostream_iterator<std::string>(filter, " "));
 
-	basic_process process;
+	std::map<int, std::string> rdata_repl;
+	if (a_repl.size()) {
+		addr a(a_repl, false);
+		rdata_repl[QUERY_TYPE_A] = a.get();
+	}
+	if (aaaa_repl.size()) {
+		addr a(aaaa_repl, true);
+		rdata_repl[QUERY_TYPE_AAAA] = a.get();
+	}
+
+	basic_process process(query, rdata_repl);
 
 	pcap p(device, max_size);
 	p.run(filter.str(), std::bind(&basic_process::got_packet, &process, std::placeholders::_1, std::placeholders::_2));

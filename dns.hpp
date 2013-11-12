@@ -13,6 +13,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#include <boost/regex.hpp>
+
 #define uloga(f, a...) fprintf(stdout, f, ##a)
 #define ulog_err(f, a...) uloga(f ": %s [%d].\n", ##a, strerror(errno), errno)
 
@@ -97,14 +99,15 @@ enum query_type {
 	QUERY_TYPE_MINFO,	/* mailbox or mail list information */
 	QUERY_TYPE_MX,		/* mail exchange */
 	QUERY_TYPE_TXT,		/* text strings */
+	QUERY_TYPE_AAAA = 28,	/* ipv6 host address */
 	QUERY_TYPE_AXFR = 252,	/* a request for a transfer of an entire zone */
 	QUERY_TYPE_MAILB,	/* a request for mailbox-related records (MB, MG or MR) */
 	QUERY_TYPE_ALL,		/* A request for all records */
 };
 
-class name {
+class qname {
 	public:
-		name(const u_char *message, size_t offset, size_t size) : m_namelen(0), m_max_size(size), m_consumed(0) {
+		qname(const u_char *message, size_t offset, size_t size) : m_namelen(0), m_max_size(size), m_consumed(0) {
 			memset(m_name, 0, sizeof(m_name));
 			parse(message, message + offset);
 		}
@@ -113,7 +116,7 @@ class name {
 			return m_consumed;
 		}
 
-		const char *data() const {
+		const char *name() const {
 			return m_name;
 		}
 
@@ -140,7 +143,7 @@ class name {
 				} else {
 					if (m_namelen + len + 1 >= sizeof(m_name)) {
 						std::ostringstream ss;
-						ss << "name: parser went out of name bounds: current-name-len: " << m_namelen << ", new-chunk-len: " << len << ", max: " << sizeof(m_name);
+						ss << "qname: parser went out of name bounds: current-name-len: " << m_namelen << ", new-chunk-len: " << len << ", max: " << sizeof(m_name);
 						throw std::runtime_error(ss.str());
 					}
 
@@ -156,7 +159,7 @@ class name {
 
 				if (m_consumed >= m_max_size) {
 					std::ostringstream ss;
-					ss << "name: parser went out of message bounds: namelen: " << m_namelen << ", message-size: " << m_max_size;
+					ss << "qname: parser went out of message bounds: namelen: " << m_namelen << ", message-size: " << m_max_size;
 					throw std::runtime_error(ss.str());
 				}
 			}
@@ -176,7 +179,11 @@ class question {
 			m_type = ntohs(data[0]);
 			m_class = ntohs(data[1]);
 
-			uloga("question: name: '%s', type: %d, class: %d.\n", m_name.data(), m_type, m_class);
+			uloga("question: name: '%s', type: %d, class: %d.\n", m_name.name(), m_type, m_class);
+		}
+
+		std::string name() const {
+			return m_name.name();
 		}
 
 		size_t consumed() const {
@@ -184,7 +191,7 @@ class question {
 		}
 
 	private:
-		name m_name;
+		qname m_name;
 		u16 m_type, m_class;
 };
 
@@ -204,7 +211,7 @@ class rr {
 			u16 rdlen = ntohs(data[4]);
 			m_rdata.assign((char *)message + offset + m_name.consumed() + 10, rdlen);
 
-			uloga("rr: name: '%s', type: %d, class: %d, ttl: %d, rdlen: %d.\n", m_name.data(), m_type, m_class, m_ttl, rdlen);
+			uloga("rr: name: '%s', type: %d, class: %d, ttl: %d, rdlen: %d.\n", m_name.name(), m_type, m_class, m_ttl, rdlen);
 		}
 
 		u16 type() const {
@@ -215,11 +222,15 @@ class rr {
 			return m_rdata;
 		}
 
+		void set_rdata(const std::string &rdata) {
+			m_rdata = rdata;
+		}
+
 		size_t consumed() const {
 			return m_name.consumed() + 10 + m_rdata.size();
 		}
 	private:
-		name m_name;
+		qname m_name;
 		std::string m_rdata;
 
 		u16 m_type;
@@ -229,9 +240,11 @@ class rr {
 
 class dns {
 	public:
-		void parse(const u_char *message, size_t size) {
+		bool parse(const u_char *message, size_t size, const boost::regex &question_repl, const std::map<int, std::string> &rr_repl) {
 			if (size < sizeof(struct query_header))
-				return;
+				return false;
+
+			bool want_injection = false;
 
 			struct query_header *h = (struct query_header *)message;
 			query_parse_header(h);
@@ -241,15 +254,35 @@ class dns {
 				question q(message, offset, size);
 				offset += q.consumed();
 
+				if (regex_match(q.name(), question_repl)) {
+					want_injection = true;
+				}
+
 				m_questions.emplace_back(std::move(q));
 			}
 
+			// only inject packets for matched queries
+			if (!want_injection)
+				return false;
+
+			bool replaced = false;
 			for (int i = 0; i < h->answer_num + h->auth_num + h->addon_num; ++i) {
 				rr r(message, offset, size);
+
+				// update offset before potential RR update, otherwise rr.consumed() will not
+				// correspond to how many bytes were actually processed by this RR
 				offset += r.consumed();
+
+				auto repl = rr_repl.find(r.type());
+				if (repl != rr_repl.end()) {
+					r.set_rdata(repl->second);
+					replaced = true;
+				}
 
 				m_rrs.emplace_back(std::move(r));
 			}
+
+			return replaced;
 		}
 
 	private:
