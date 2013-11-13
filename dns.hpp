@@ -107,9 +107,14 @@ enum query_type {
 
 class qname {
 	public:
-		qname(const u_char *message, size_t offset, size_t size) : m_namelen(0), m_max_size(size), m_consumed(0) {
+		qname(const std::string &name) {
+			m_namelen = snprintf(m_name, sizeof(m_name), "%s", name.c_str());
+			m_consumed = 0;
+		}
+
+		qname(const u_char *message, size_t offset, size_t max_size) : m_namelen(0), m_consumed(0) {
 			memset(m_name, 0, sizeof(m_name));
-			parse(message, message + offset);
+			parse(message, message + offset, max_size);
 		}
 
 		size_t consumed() const {
@@ -120,13 +125,32 @@ class qname {
 			return m_name;
 		}
 
+		std::string pack() const {
+			std::ostringstream ss;
+			unsigned char len;
+
+			size_t start = 0;
+			for (size_t i = 0; i < m_namelen; ++i) {
+				if (m_name[i] == '.') {
+					len = i - start;
+
+					ss << len;
+					ss.write(&m_name[start], len);
+
+					start = i + 1;
+				}
+			}
+
+			ss << '\0';
+			return ss.str();
+		}
+
 	private:
 		char m_name[QUERY_RR_NAME_MAX_SIZE];
 		size_t m_namelen;
-		size_t m_max_size;
 		size_t m_consumed;
 
-		void parse(const u_char *message, const u_char *nptr) {
+		void parse(const u_char *message, const u_char *nptr, size_t max_size) {
 			unsigned char len;
 
 			while (nptr && (len = *nptr)) {
@@ -137,7 +161,7 @@ class qname {
 					u16 offset = ntohs(o) & ~0xc000;
 
 					size_t old_consumed = m_consumed;
-					parse(message, message + offset);
+					parse(message, message + offset, max_size);
 					m_consumed = old_consumed + 1;
 					return;
 				} else {
@@ -157,9 +181,9 @@ class qname {
 					m_consumed += len;
 				}
 
-				if (m_consumed >= m_max_size) {
+				if (m_consumed >= max_size) {
 					std::ostringstream ss;
-					ss << "qname: parser went out of message bounds: namelen: " << m_namelen << ", message-size: " << m_max_size;
+					ss << "qname: parser went out of message bounds: namelen: " << m_namelen << ", message-size: " << max_size;
 					throw std::runtime_error(ss.str());
 				}
 			}
@@ -190,6 +214,20 @@ class question {
 			return m_name.consumed() + 2 * 2;
 		}
 
+		u16 qclass() const {
+			return m_class;
+		}
+
+		std::string pack() const {
+			std::ostringstream ss;
+
+			ss << m_name.pack() <<
+				htons(m_type) <<
+				htons(m_class);
+
+			return ss.str();
+		}
+
 	private:
 		qname m_name;
 		u16 m_type, m_class;
@@ -197,6 +235,9 @@ class question {
 
 class rr {
 	public:
+		rr(const std::string &name, u16 qtype, u16 qclass, u32 ttl, const std::string &rdata) : m_name(name), m_type(qtype), m_class(qclass), m_ttl(ttl), m_rdata(rdata) {
+		}
+
 		rr(const u_char *message, size_t offset, size_t size) : m_name(message, offset, size) {
 			const u16 *data = (const u16 *)(message + offset + m_name.consumed());
 			for (size_t i = 0; i < size; ++i) {
@@ -229,68 +270,105 @@ class rr {
 		size_t consumed() const {
 			return m_name.consumed() + 10 + m_rdata.size();
 		}
+
+		std::string pack() const {
+			std::ostringstream ss;
+
+			ss << m_name.pack() <<
+				htons(m_type) <<
+				htons(m_class) <<
+				htonl(m_ttl) <<
+				htons(m_rdata.size()) <<
+				m_rdata;
+
+			return ss.str();
+		}
+
 	private:
 		qname m_name;
-		std::string m_rdata;
 
 		u16 m_type;
 		u16 m_class;
 		u32 m_ttl;
+
+		std::string m_rdata;
 };
 
-class dns {
+class query {
 	public:
-		bool parse(const u_char *message, size_t size, const boost::regex &question_repl, const std::map<int, std::string> &rr_repl) {
+		query(const u_char *message, size_t size) {
 			if (size < sizeof(struct query_header))
-				return false;
+				return;
 
-			bool want_injection = false;
+			const struct query_header *h = (const struct query_header *)message;
 
-			struct query_header *h = (struct query_header *)message;
-			query_parse_header(h);
+			m_header = *h;
+			query_parse_header(&m_header);
 
 			size_t offset = sizeof(struct query_header);
-			for (int i = 0; i < h->question_num; ++i) {
+			for (int i = 0; i < m_header.question_num; ++i) {
 				question q(message, offset, size);
 				offset += q.consumed();
-
-				if (regex_match(q.name(), question_repl)) {
-					want_injection = true;
-				}
 
 				m_questions.emplace_back(std::move(q));
 			}
 
-			// only inject packets for matched queries
-			if (!want_injection)
-				return false;
-
-			bool replaced = false;
-			for (int i = 0; i < h->answer_num + h->auth_num + h->addon_num; ++i) {
+			for (int i = 0; i < m_header.answer_num + m_header.auth_num + m_header.addon_num; ++i) {
 				rr r(message, offset, size);
-
-				// update offset before potential RR update, otherwise rr.consumed() will not
-				// correspond to how many bytes were actually processed by this RR
 				offset += r.consumed();
-
-				auto repl = rr_repl.find(r.type());
-				if (repl != rr_repl.end()) {
-					r.set_rdata(repl->second);
-					replaced = true;
-				}
 
 				m_rrs.emplace_back(std::move(r));
 			}
+		}
 
-			return replaced;
+		bool match(const boost::regex &question_repl) const {
+			// we are too late - this is already a response
+			if (m_header.flags & QUERY_FLAGS_RESPONSE)
+				return false;
+
+			for (auto & q : m_questions) {
+				if (regex_match(q.name(), question_repl)) {
+					return true;
+				}
+			}
+
+			return false;
+		}
+
+		std::string pack(const std::map<u16, std::string> &rrs, u32 ttl) const {
+			std::ostringstream ss;
+
+			struct query_header header = m_header;
+
+			header.answer_num = rrs.size() * m_questions.size();
+			header.auth_num = 0;
+			header.addon_num = 0;
+
+			query_header_convert(&header);
+
+			ss.write((char *)&header, sizeof(struct query_header));
+
+			for (auto & q : m_questions) {
+				ss << q.pack();
+			}
+
+			for (auto & q : m_questions) {
+				for (auto & r : rrs) {
+					rr obj(q.name(), r.first, q.qclass(), ttl, r.second);
+					ss << obj.pack();
+				}
+			}
+
+			std::cout << "query: packed data to be injected" << std::endl;
+			return ss.str();
 		}
 
 	private:
-		u16 m_id, m_flags;
+		struct query_header m_header;
 		std::vector<question> m_questions;
 		std::vector<rr> m_rrs;
 
-		void query_header_convert(struct query_header *h) {
+		void query_header_convert(struct query_header *h) const {
 			h->id = ntohs(h->id);
 			h->flags = ntohs(h->flags);
 			h->question_num = ntohs(h->question_num);
@@ -299,13 +377,10 @@ class dns {
 			h->addon_num = ntohs(h->addon_num);
 		}
 
-		void query_parse_header(struct query_header *h) {
+		void query_parse_header(struct query_header *h) const {
 			u16 opcode, rcode;
 
 			query_header_convert(h);
-
-			m_id = h->id;
-			m_flags = h->flags;
 
 			opcode = (h->flags >> QUERY_FLAGS_OPCODE_SHIFT) & QUERY_FLAGS_OPCODE_MASK;
 			rcode = (h->flags >> QUERY_FLAGS_RCODE_SHIFT) & QUERY_FLAGS_RCODE_MASK;

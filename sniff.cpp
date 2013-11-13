@@ -125,7 +125,7 @@ class pcap {
 
 class basic_process {
 	public:
-		basic_process(const std::string &query, const std::map<int, std::string> &rdata_repl) : m_re(query), m_repl(rdata_repl) {
+		basic_process(const std::string &query, const std::map<u16, std::string> &rdata_repl, u32 ttl) : m_re(query), m_repl(rdata_repl), m_ttl(ttl) {
 		}
 
 		void got_packet(const struct pcap_pkthdr *header, const u_char *packet) {
@@ -143,12 +143,12 @@ class basic_process {
 			udp = (struct udphdr *)(packet + sizeof(*eth) + ip_size);
 
 			try {
-				dns d;
-
 				u_char *data = (u_char *)(((u_char *)udp) + 8);
-				if (d.parse(data, ntohs(udp->len), m_re, m_repl)) {
+				query q(data, ntohs(udp->len));
+
+				if (q.match(m_re)) {
 					std::cout << header->ts << ": " << dump_eth(eth) << " : " << dump_addr(ip, udp) << std::endl;
-					inject(d);
+					inject(q);
 				}
 			} catch (const std::exception &e) {
 				std::cout << "failed to process: " << e.what() << std::endl;
@@ -157,7 +157,8 @@ class basic_process {
 
 	private:
 		boost::regex m_re;
-		std::map<int, std::string> m_repl;
+		std::map<u16, std::string> m_repl;
+		u32 m_ttl;
 
 		void dump_eth_single(std::ostringstream &ss, const u_int8_t *header) {
 			char tmp[4];
@@ -191,7 +192,8 @@ class basic_process {
 			return ss.str();
 		}
 
-		void inject(const dns &d) {
+		void inject(const query &q) {
+			std::string str = q.pack(m_repl, m_ttl);
 		}
 };
 
@@ -246,12 +248,14 @@ int main(int argc, char *argv[])
 	bpo::options_description generic("Parser options");
 
 	std::string device, query, a_repl, aaaa_repl;
+	u32 ttl;
 	int max_size;
 	generic.add_options()
 		("help", "This help message")
 		("size", bpo::value<int>(&max_size)->default_value(1000), "Maximum capture size for single packet")
 		("device", bpo::value<std::string>(&device), "Sniffing device")
 		("query", bpo::value<std::string>(&query), "DNS query to hijack replies")
+		("ttl", bpo::value<u32>(&ttl)->default_value(100), "DNS record TTL")
 		("A", bpo::value<std::string>(&a_repl), "Replace A record reply with this address")
 		("AAAA", bpo::value<std::string>(&aaaa_repl), "Replace AAAA record reply with this address")
 		;
@@ -290,7 +294,7 @@ int main(int argc, char *argv[])
 	std::ostringstream filter;
 	std::copy(words.begin(), words.end(), std::ostream_iterator<std::string>(filter, " "));
 
-	std::map<int, std::string> rdata_repl;
+	std::map<u16, std::string> rdata_repl;
 	if (a_repl.size()) {
 		addr a(a_repl, false);
 		rdata_repl[QUERY_TYPE_A] = a.get();
@@ -300,7 +304,7 @@ int main(int argc, char *argv[])
 		rdata_repl[QUERY_TYPE_AAAA] = a.get();
 	}
 
-	basic_process process(query, rdata_repl);
+	basic_process process(query, rdata_repl, ttl);
 
 	pcap p(device, max_size);
 	p.run(filter.str(), std::bind(&basic_process::got_packet, &process, std::placeholders::_1, std::placeholders::_2));
