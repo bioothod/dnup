@@ -18,7 +18,7 @@
 #define uloga(f, a...) fprintf(stdout, f, ##a)
 #define ulog_err(f, a...) uloga(f ": %s [%d].\n", ##a, strerror(errno), errno)
 
-#define QUERY_DEBUG
+//#define QUERY_DEBUG
 
 #ifdef QUERY_DEBUG
 #define ulog(f, a...) uloga(f, ##a)
@@ -141,6 +141,13 @@ class qname {
 				}
 			}
 
+			if (start != m_namelen) {
+				len = m_namelen - start;
+
+				ss << len;
+				ss.write(&m_name[start], len);
+			}
+
 			ss << '\0';
 			return ss.str();
 		}
@@ -203,7 +210,7 @@ class question {
 			m_type = ntohs(data[0]);
 			m_class = ntohs(data[1]);
 
-			uloga("question: name: '%s', type: %d, class: %d.\n", m_name.name(), m_type, m_class);
+			ulog("question: name: '%s', type: %d, class: %d.\n", m_name.name(), m_type, m_class);
 		}
 
 		std::string name() const {
@@ -221,9 +228,11 @@ class question {
 		std::string pack() const {
 			std::ostringstream ss;
 
-			ss << m_name.pack() <<
-				htons(m_type) <<
-				htons(m_class);
+			ss << m_name.pack();
+			u16 tmp = htons(m_type);
+			ss.write((char *)&tmp, sizeof(tmp));
+			tmp = htons(m_class);
+			ss.write((char *)&tmp, sizeof(tmp));
 
 			return ss.str();
 		}
@@ -240,11 +249,12 @@ class rr {
 
 		rr(const u_char *message, size_t offset, size_t size) : m_name(message, offset, size) {
 			const u16 *data = (const u16 *)(message + offset + m_name.consumed());
+#ifdef QUERY_DEBUG
 			for (size_t i = 0; i < size; ++i) {
 				printf("%02x ", message[i]);
 			}
 			printf("\noffset: %zd, consumed: %zd\n", offset, m_name.consumed());
-
+#endif
 			m_type = ntohs(data[0]);
 			m_class = ntohs(data[1]);
 			m_ttl = ntohl(*(u32 *)(data + 2));
@@ -252,7 +262,7 @@ class rr {
 			u16 rdlen = ntohs(data[4]);
 			m_rdata.assign((char *)message + offset + m_name.consumed() + 10, rdlen);
 
-			uloga("rr: name: '%s', type: %d, class: %d, ttl: %d, rdlen: %d.\n", m_name.name(), m_type, m_class, m_ttl, rdlen);
+			ulog("rr: name: '%s', type: %d, class: %d, ttl: %d, rdlen: %d.\n", m_name.name(), m_type, m_class, m_ttl, rdlen);
 		}
 
 		u16 type() const {
@@ -274,12 +284,18 @@ class rr {
 		std::string pack() const {
 			std::ostringstream ss;
 
-			ss << m_name.pack() <<
-				htons(m_type) <<
-				htons(m_class) <<
-				htonl(m_ttl) <<
-				htons(m_rdata.size()) <<
-				m_rdata;
+			ss << m_name.pack();
+
+			u16 tmp = htons(m_type);
+			ss.write((char *)&tmp, sizeof(tmp));
+			tmp = htons(m_class);
+			ss.write((char *)&tmp, sizeof(tmp));
+			u32 tmpl = htonl(m_ttl);
+			ss.write((char *)&tmpl, sizeof(tmpl));
+			tmp = htons(m_rdata.size());
+			ss.write((char *)&tmp, sizeof(tmp));
+
+			ss << m_rdata;
 
 			return ss.str();
 		}
@@ -378,14 +394,14 @@ class query {
 		}
 
 		void query_parse_header(struct query_header *h) const {
-			u16 opcode, rcode;
-
 			query_header_convert(h);
 
+#ifdef QUERY_DEBUG
+			u16 opcode, rcode;
 			opcode = (h->flags >> QUERY_FLAGS_OPCODE_SHIFT) & QUERY_FLAGS_OPCODE_MASK;
 			rcode = (h->flags >> QUERY_FLAGS_RCODE_SHIFT) & QUERY_FLAGS_RCODE_MASK;
 
-			uloga("id: %04x: flags: resp: %d, opcode: %d, auth: %d, trunc: %d, RD: %d, RA: %d, rcode: %d.\n",
+			ulog("id: %04x: flags: resp: %d, opcode: %d, auth: %d, trunc: %d, RD: %d, RA: %d, rcode: %d.\n",
 					h->id,
 					!!(h->flags & QUERY_FLAGS_RESPONSE),
 					opcode,
@@ -394,8 +410,9 @@ class query {
 					!!(h->flags & QUERY_FLAGS_RD),
 					!!(h->flags & QUERY_FLAGS_RA),
 					rcode);
-			uloga("question: %d, answer: %d, auth: %d, addon: %d.\n",
+			ulog("question: %d, answer: %d, auth: %d, addon: %d.\n",
 					h->question_num, h->answer_num, h->auth_num, h->addon_num);
+#endif
 
 #define CHECK_INVAL(x) do { \
 	if ((x) > 100) \
