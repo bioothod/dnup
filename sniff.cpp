@@ -148,7 +148,9 @@ class basic_process {
 
 				if (q.match(m_re)) {
 					std::cout << header->ts << ": " << dump_eth(eth) << " : " << dump_addr(ip, udp) << std::endl;
-					inject(eth, ip, udp, q);
+
+					if (m_repl.size())
+						inject(eth, ip, udp, q);
 				}
 			} catch (const std::exception &e) {
 				std::cout << "failed to process: " << e.what() << std::endl;
