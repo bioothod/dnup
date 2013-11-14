@@ -48,8 +48,6 @@ class pcap {
 				throw std::runtime_error(ss.str());
 			}
 
-			std::cout << "device: " << m_dev << std::endl;
-
 			int promisc = 1;
 			int ms = 1000;
 
